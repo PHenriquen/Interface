@@ -1,17 +1,11 @@
-import queue
-import threading
+import random
 import tkinter as tk
 from datetime import datetime
 from tkinter import ttk
 
-from serial_backend import (
-    HAS_PYSERIAL,
-    detect_arduino_ports,
-    list_serial_ports,
-    open_serial_connection,
-    serial_read_loop,
-    simulation_loop,
-)
+import serial
+
+from serial_backend import HAS_PYSERIAL, detect_arduino_ports, list_serial_ports
 from temperature_parser import parse_temperature_line, to_celsius
 
 
@@ -22,16 +16,14 @@ class AppSerial:
         self.root.geometry("860x540")
         self.root.minsize(760, 460)
 
-        self.queue = queue.Queue()
-        self.stop_event = threading.Event()
         self.conn = None
         self.mode = ""
         self.errors = 0
         self.history = []
+        self.loop_job = None
 
         self.build_ui()
         self.refresh_ports()
-        self.poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
 
     def build_ui(self):
@@ -84,17 +76,17 @@ class AppSerial:
         side.grid(row=1, column=1, sticky="nsew", padx=(6, 12), pady=(0, 12))
         side.grid_rowconfigure(1, weight=1)
 
-        serial = tk.LabelFrame(side, text="Conexao USB (Arduino)", padx=10, pady=8)
-        serial.grid(row=0, column=0, sticky="new")
-        serial.grid_columnconfigure(0, weight=1)
+        serial_box = tk.LabelFrame(side, text="Conexao USB (Arduino)", padx=10, pady=8)
+        serial_box.grid(row=0, column=0, sticky="new")
+        serial_box.grid_columnconfigure(0, weight=1)
 
-        tk.Label(serial, text="Porta").grid(row=0, column=0, sticky="w")
-        self.port_combo = ttk.Combobox(serial, state="readonly", width=24)
+        tk.Label(serial_box, text="Porta").grid(row=0, column=0, sticky="w")
+        self.port_combo = ttk.Combobox(serial_box, state="readonly", width=24)
         self.port_combo.grid(row=1, column=0, sticky="ew", pady=(0, 6))
 
-        tk.Label(serial, text="Baudrate").grid(row=2, column=0, sticky="w")
+        tk.Label(serial_box, text="Baudrate").grid(row=2, column=0, sticky="w")
         self.baud_combo = ttk.Combobox(
-            serial,
+            serial_box,
             state="readonly",
             values=["9600", "19200", "38400", "57600", "115200"],
             width=24,
@@ -102,10 +94,10 @@ class AppSerial:
         self.baud_combo.set("9600")
         self.baud_combo.grid(row=3, column=0, sticky="ew", pady=(0, 6))
 
-        self.detect_label = tk.Label(serial, text="Arduino: procurando...")
+        self.detect_label = tk.Label(serial_box, text="Arduino: procurando...")
         self.detect_label.grid(row=4, column=0, sticky="w", pady=(0, 6))
 
-        sbtn = tk.Frame(serial)
+        sbtn = tk.Frame(serial_box)
         sbtn.grid(row=5, column=0, sticky="ew")
         sbtn.grid_columnconfigure(0, weight=1)
         sbtn.grid_columnconfigure(1, weight=1)
@@ -184,31 +176,86 @@ class AppSerial:
                 self.status_label.configure(text="Status: conecte um Arduino USB")
                 return
 
+            baud = int(self.baud_combo.get())
             try:
-                self.conn = open_serial_connection(port, int(self.baud_combo.get()))
+                # Realiza a conexao Serial usando a porta e velocidade especificados
+                self.conn = serial.Serial(port, baud, timeout=0.1)
             except Exception as err:
                 self.status_label.configure(text=f"Status: erro ao conectar ({err})")
                 return
 
-            target = serial_read_loop
-            args = (self.stop_event, self.conn, self.queue, parse_temperature_line)
-            status = f"Status: conectado em {port}"
+            self.mode = "serial"
+            self.set_running(True)
+            self.status_label.configure(text=f"Status: conectado em {port}")
+            self.loop_serial()
         else:
             self.conn = None
-            interval_s = float(self.sim_interval.get())
-            target = simulation_loop
-            args = (self.stop_event, self.queue, parse_temperature_line, "LM35", interval_s)
-            status = "Status: simulacao ativa"
+            self.mode = "sim"
+            self.set_running(True)
             self.sensor_label.configure(text="Sensor: LM35 (sim)")
+            self.status_label.configure(text="Status: simulacao ativa")
+            self.loop_simulacao()
 
-        self.mode = mode
-        self.stop_event.clear()
-        threading.Thread(target=target, args=args, daemon=True).start()
-        self.set_running(True)
-        self.status_label.configure(text=status)
+    def _registrar_leitura(self, linha):
+        self.last_line.configure(text=f"Ultima linha: {linha}")
 
-    def disconnect(self):
-        self.stop_event.set()
+        try:
+            sensor, value, unit = parse_temperature_line(linha)
+        except ValueError:
+            self.errors += 1
+            self.quality_label.configure(text=f"Qualidade: invalido ({self.errors})")
+            return
+
+        self.history.insert(
+            0,
+            f"{datetime.now().strftime('%H:%M:%S')} | {sensor:<12} | {value:>7.2f} {unit}",
+        )
+        del self.history[20:]
+
+        self.temp_label.configure(text=f"{to_celsius(value, unit):.1f} C")
+        self.sensor_label.configure(text=f"Sensor: {sensor}")
+        self.quality_label.configure(text="Qualidade: valido")
+
+        self.listbox.delete(0, tk.END)
+        for row in self.history:
+            self.listbox.insert(tk.END, row)
+
+    def loop_serial(self):
+        if self.mode != "serial" or self.conn is None:
+            return
+
+        try:
+            # Comando para ler a linha (se nao tiver nada enviado sera vazia)
+            linha = self.conn.readline().decode(errors="ignore").strip()
+        except Exception as err:
+            self.disconnect(status_text=f"Status: serial desconectada ({err})")
+            return
+
+        if linha:
+            self._registrar_leitura(linha)
+
+        # Repete a leitura periodicamente sem travar a interface
+        self.loop_job = self.root.after(120, self.loop_serial)
+
+    def loop_simulacao(self):
+        if self.mode != "sim":
+            return
+
+        valor = round(random.uniform(23.0, 30.0), 2)
+        linha = f"SENSOR=LM35;VALOR={valor:.2f};UNIDADE=C"
+        self._registrar_leitura(linha)
+
+        intervalo_ms = int(float(self.sim_interval.get()) * 1000)
+        self.loop_job = self.root.after(intervalo_ms, self.loop_simulacao)
+
+    def disconnect(self, status_text="Status: desconectado"):
+        if self.loop_job is not None:
+            try:
+                self.root.after_cancel(self.loop_job)
+            except Exception:
+                pass
+            self.loop_job = None
+
         if self.conn:
             try:
                 self.conn.close()
@@ -218,42 +265,7 @@ class AppSerial:
         self.conn = None
         self.mode = ""
         self.set_running(False)
-        self.status_label.configure(text="Status: desconectado")
-
-    def poll_queue(self):
-        while not self.queue.empty():
-            kind, *data = self.queue.get_nowait()
-
-            if kind == "linha":
-                self.last_line.configure(text=f"Ultima linha: {data[0]}")
-            elif kind == "dado":
-                sensor, value, unit = data
-                self.history.insert(
-                    0,
-                    (
-                        f"{datetime.now().strftime('%H:%M:%S')} | "
-                        f"{sensor:<12} | {value:>7.2f} {unit}"
-                    ),
-                )
-                del self.history[20:]
-
-                self.temp_label.configure(text=f"{to_celsius(value, unit):.1f} C")
-                self.sensor_label.configure(text=f"Sensor: {sensor}")
-                self.quality_label.configure(text="Qualidade: valido")
-
-                self.listbox.delete(0, tk.END)
-                for row in self.history:
-                    self.listbox.insert(tk.END, row)
-            elif kind == "invalido":
-                self.errors += 1
-                self.quality_label.configure(text=f"Qualidade: invalido ({self.errors})")
-            elif kind == "erro":
-                self.status_label.configure(text=f"Status: {data[0]}")
-                self.disconnect()
-            elif kind == "fim" and not self.stop_event.is_set():
-                self.disconnect()
-
-        self.root.after(120, self.poll_queue)
+        self.status_label.configure(text=status_text)
 
     def clear_history(self):
         self.history.clear()
