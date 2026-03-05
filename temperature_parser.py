@@ -1,4 +1,4 @@
-﻿import re
+import re
 
 
 def parse_temperature_line(text):
@@ -39,14 +39,28 @@ def parse_temperature_line(text):
 def parse_legacy_line(text):
     lowered = text.lower()
 
-    match_c = re.search(r"celsius[^0-9-]*(-?\d+(?:[.,]\d+)?)", lowered)
+    # Match both patterns:
+    # "celsius: 23.5" and "23.5 celsius"
+    match_c = re.search(
+        r"(?:celsius|centigrados?|centigrade|c)\s*[:=]?\s*(-?\d+(?:[.,]\d+)?)",
+        lowered,
+    )
+    if not match_c:
+        match_c = re.search(
+            r"(-?\d+(?:[.,]\d+)?)\s*(?:\u00b0\s*c|celsius|centigrados?|centigrade)\b",
+            lowered,
+        )
     if match_c:
         try:
             return float(match_c.group(1).replace(",", ".")), "C"
         except ValueError:
             pass
 
-    match_f = re.search(r"fahrenheit[^0-9-]*(-?\d+(?:[.,]\d+)?)", lowered)
+    # Match both patterns:
+    # "fahrenheit: 77" and "77 fahrenheit" / "77F"
+    match_f = re.search(r"fahrenheit\s*[:=]?\s*(-?\d+(?:[.,]\d+)?)", lowered)
+    if not match_f:
+        match_f = re.search(r"(-?\d+(?:[.,]\d+)?)\s*(?:\u00b0\s*f|f)\b", lowered)
     if match_f:
         try:
             return float(match_f.group(1).replace(",", ".")), "F"
@@ -56,6 +70,9 @@ def parse_legacy_line(text):
     match_temp = re.search(r"temperatura[^0-9-]*(-?\d+(?:[.,]\d+)?)", lowered)
     if match_temp:
         try:
+            # If only Fahrenheit context is present, preserve unit F.
+            if "fahrenheit" in lowered and "celsius" not in lowered:
+                return float(match_temp.group(1).replace(",", ".")), "F"
             return float(match_temp.group(1).replace(",", ".")), "C"
         except ValueError:
             pass
@@ -71,7 +88,8 @@ def parse_legacy_line(text):
 
 
 def to_celsius(value, unit):
-    normalized = (unit or "").strip().upper()
+    normalized = (unit or "").strip().upper().replace(" ", "")
+    normalized = normalized.replace("\u00b0", "")
     if normalized in ("F", "FAHRENHEIT"):
         return (value - 32.0) * 5.0 / 9.0
     return value
